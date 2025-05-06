@@ -1,0 +1,107 @@
+/*
+====================================================================
+📘 Jenkins Post Block Configuration Instructions
+====================================================================
+
+🔐 Required Credentials (Manage Jenkins > Credentials):
+------------------------------------------------------
+Add the following as **Secret Text** credentials:
+- 'jenkins-username' : Jenkins API username.
+- 'api-token'        : API token for the Jenkins user.
+- 'secret-key'       : 32-character AES encryption key.
+- 'iv-key'           : 16-character AES initialization vector (IV).
+
+🌐 Optional Environment Variables:
+---------------------------------
+To override default URLs, set the following in your pipeline:
+- 'WEBHOOK_URL'  : URL to POST JSON build + stage data (default: hardcoded URL in script).
+
+⚙️ What the Script Does:
+------------------------
+- Uses Jenkins REST API to fetch build metadata and stage info.
+- Computes SHA-256 checksum of the entire payload for integrity verification.
+- Encrypts the current timestamp using AES-256-CBC for secure header signing.
+- Sends the combined JSON payload to a webhook endpoint with custom headers.
+
+📦 Requirements:
+----------------
+Make sure your Jenkins agents have the following tools installed:
+- curl
+- openssl
+- xxd
+- base64
+- sha256sum
+- jq
+
+✅ When This Runs:
+------------------
+This block runs in `post { always { ... } }` which means it executes after
+**every build**, regardless of whether the build was successful or failed.
+
+====================================================================
+*/
+
+post {
+    always {
+        script {
+            withCredentials([
+                string(credentialsId: 'jenkins-username', variable: 'JENKINS_USERNAME'),
+                string(credentialsId: 'api-token', variable: 'API_TOKEN'),
+                string(credentialsId: 'secret-key', variable: 'SECRET_KEY'),
+                string(credentialsId: 'iv-key', variable: 'IV_KEY')
+            ]) {
+                def getRawJson = { url ->
+                    sh(script: "curl -s -u '$JENKINS_USERNAME:$API_TOKEN' '${url}'", returnStdout: true).trim()
+                }
+
+                def buildData = getRawJson("${env.JENKINS_URL}/job/${env.JOB_NAME}/${env.BUILD_NUMBER}/api/json")
+                def stageData = getRawJson("${env.JENKINS_URL}/job/${env.JOB_NAME}/${env.BUILD_NUMBER}/wfapi/describe")
+
+                def timestamp = System.currentTimeMillis().toString()
+
+                def encryptedTimestamp = sh(script: """
+                    echo -n '${timestamp}' | openssl enc -aes-256-cbc -base64 \\
+                    -K \$(echo -n '${SECRET_KEY}' | xxd -p | tr -d '\\n') \\
+                    -iv \$(echo -n '${IV_KEY}' | xxd -p | tr -d '\\n')
+                """, returnStdout: true).trim()
+
+                // Parse stage data to get nodeIds (but don't keep parsed objects)
+                def stageIds = sh(
+                    script: """curl -s -u '$JENKINS_USERNAME:$API_TOKEN' '${env.JENKINS_URL}/job/${env.JOB_NAME}/${env.BUILD_NUMBER}/wfapi/describe' | jq -r '.stages[].id'""",
+                    returnStdout: true
+                ).trim().split('\n')
+                
+
+
+                // Manually build node_stage_data array as a string
+                def nodeStageDataStr = stageIds.collect { nodeId ->
+                    def nodeJsonRaw = sh(
+                        script: """curl -s -u '$JENKINS_USERNAME:$API_TOKEN' '${env.JENKINS_URL}/job/${env.JOB_NAME}/${env.BUILD_NUMBER}/execution/node/${nodeId}/wfapi/describe'""",
+                        returnStdout: true
+                    ).trim()
+                    return """{"nodeId":${groovy.json.JsonOutput.toJson(nodeId)},"data":${nodeJsonRaw}}"""
+                }.join(',')
+                def webhookUrl = 'https://1d41-192-245-162-37.ngrok-free.app/web'
+
+
+                // Final payload as JSON string
+                def payload = """{
+                    "build_data": ${buildData},
+                    "node_stage_data": [${nodeStageDataStr}]
+                }""".replace("'", "'\"'\"'")
+                
+                // Calculate SHA256 checksum of the payload
+                def checksum = sh(script: "echo -n '${payload}' | sha256sum | awk '{print \$1}'", returnStdout: true).trim()
+                
+                // Send the payload with checksum and encrypted timestamp
+                sh """
+                    curl -X POST '${webhookUrl}' \\
+                    -H "Content-Type: application/json" \\
+                    -H "X-Encrypted-Timestamp: ${encryptedTimestamp}" \\
+                    -H "X-Checksum: ${checksum}" \\
+                    -d '${payload}'
+                """
+            }
+        }
+    }
+}
